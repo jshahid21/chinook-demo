@@ -1,0 +1,6 @@
+langchain
+langchain-anthropic
+langgraph
+langgraph-cli[inmem]
+langsmith
+pydantic
