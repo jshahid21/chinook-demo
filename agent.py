@@ -1,3 +1,6 @@
+import warnings
+warnings.filterwarnings("ignore", message=".*allowed_objects.*")
+
 from dotenv import load_dotenv
 load_dotenv()
 # Why: reads .env file and sets ANTHROPIC_API_KEY + LANGSMITH_API_KEY in the
@@ -19,7 +22,8 @@ def recommend_tracks(genre: str) -> str:
         "JOIN Genre g ON t.GenreId = g.GenreId "
         "JOIN Album al ON t.AlbumId = al.AlbumId "
         "JOIN Artist ar ON al.ArtistId = ar.ArtistId "
-        "WHERE g.Name = ? COLLATE NOCASE LIMIT 5",
+        "WHERE g.Name = ? COLLATE NOCASE "
+        "ORDER BY RANDOM() LIMIT 5",
         (genre,)
     # Why the trailing comma: makes this a 1-item tuple, not just a value in parens.
     # The `?` in the SQL is a placeholder — the database fills it from this tuple.                                                 
