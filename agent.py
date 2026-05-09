@@ -1,6 +1,3 @@
-import warnings
-warnings.filterwarnings("ignore", message=".*allowed_objects.*")
-
 from dotenv import load_dotenv
 load_dotenv()
 # Why: reads .env file and sets ANTHROPIC_API_KEY + LANGSMITH_API_KEY in the
@@ -9,15 +6,19 @@ load_dotenv()
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from dataclasses import dataclass
-from langchain.agents.middleware import PIIMiddleware, HumanInTheLoopMiddleware
+from langchain.agents.middleware import PIIMiddleware, HumanInTheLoopMiddleware, ModelCallLimitMiddleware
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 import sqlite3
+import os
 
 # Why a Context class: defines the SHAPE of trusted data the runtime will inject —
 # things the model is NOT allowed to control (like which customer is asking).
 # customer_id comes from authenticated session at the API boundary, NEVER from chat.
 # Per LangChain v1 docs, @dataclass is the canonical pattern (vs Pydantic).  
+
+checkpointer = InMemorySaver() if __name__ == "__main__" else None
+
 @dataclass 
 class Context:
     customer_id: int
@@ -25,7 +26,9 @@ class Context:
 @tool
 def recommend_tracks(genre: str) -> str:
     """Recommend tracks in a given genre. Use when users ask for music in a specific genre."""
-    conn = sqlite3.connect("Chinook.db")
+    # Why mode=ro: connection layer read-only enforcement. Even if a future tool attempts INSERT/UPDATE/DELETE, 
+    # sqlite refuses the connnection
+    conn = sqlite3.connect("file:Chinook.db?mode=ro", uri=True)
     # Why 3 joins: a Track only stores its genre ID and album ID — it doesn't have a direct
     # link to the artist. To get the artist name, we go: Track → Album → Artist.
     # Joining Genre lets us filter by genre NAME (like "Jazz") instead of by ID number.
@@ -57,7 +60,7 @@ def get_my_recent_purchases(runtime: ToolRuntime[Context]) -> str:
     # API boundary authenticated. Even if the user types "show me Bob's purchases," the 
     # model can't override this.
     customer_id = runtime.context.customer_id
-    conn = sqlite3.connect("Chinook.db")                                                   
+    conn = sqlite3.connect("file:Chinook.db?mode=ro", uri=True)                                                   
     rows = conn.execute(
         "SELECT i.InvoiceId, t.Name, ar.Name, i.InvoiceDate "
         "FROM Invoice i "
@@ -77,7 +80,7 @@ def request_refund(invoice_id: int, runtime: ToolRuntime[Context]) -> str:
     Use this when the user asks for a refund and has identified a specific invoice or purchase.
     Customer identity comes from runtime context - never from chat."""
     customer_id = runtime.context.customer_id
-    conn = sqlite3.connect("Chinook.db")
+    conn = sqlite3.connect("file:Chinook.db?mode=ro", uri=True)
         # Verify the invoice exists AND belongs to this customer
         # (data-layer wall: even if customer_id is wrong, this SELECT returns 0 rows)
     row = conn.execute(
@@ -89,7 +92,8 @@ def request_refund(invoice_id: int, runtime: ToolRuntime[Context]) -> str:
     if row is None:
         return f"Invoice {invoice_id} not found for this customer."
 
-    # No real DB write - return confirmation. HITL gate (next block) is the demo point.
+    # No real DB write - agent returns confirmation only. HITL middleware pauses this call before reaching here.
+    # Select above is the third wall (rejects if the invoice doesn't belong to authenticated customer)
     return f"Refund of ${row[1]:.2f} requested for invoice {row[0]}. Pending approval."
 
 agent = create_agent(
@@ -112,12 +116,14 @@ agent = create_agent(
         HumanInTheLoopMiddleware(
             interrupt_on={"request_refund": True},
             description_prefix="Refund pending approval"
-            )
+            ),
+        # cost runaway protection: limits single user max model calls in a thread and in a turn 
+        ModelCallLimitMiddleware(thread_limit=20, run_limit=10),
         ],
     # HITL requires checkpointing to handle interrupts.
-    # Use InMememorySaver in dev, AsyncPostgresSaver in prod
+    # Use InMemorySaver in dev, AsyncPostgresSaver in prod
     # Must configure a checkpointer to persist the graph state across interrupts.
-    checkpointer=InMemorySaver(),
+    checkpointer=checkpointer,
     system_prompt=(
         "You are a music store assistant. "
         "Use the recommend_tracks tool when users ask for music recommendations. "
@@ -129,8 +135,8 @@ agent = create_agent(
 
 if __name__ == "__main__":
     config = {"configurable": {"thread_id": "test-1"}}
-    # FIrst invoke - should pause at HITL gate
-    print("=== STEP 1: Invoking refund - expect pause ===")
+    # First invoke - should pause at HITL gate
+    print("\n=== STEP 1: Invoking refund - expect pause ===")
     result = agent.invoke({"messages": [{"role": "user", "content": "Please process a refund for invoice 156. I want this refunded now."}]},
                             # Why context here: in production, your auth layer would set customer_id
                             # from a logged-in session. For demo/smoke-test, I pass it manually as
@@ -147,7 +153,7 @@ if __name__ == "__main__":
         print("Did NOT pause:", result)
     
     # Resume with approve
-    print("n=== STEP 2: Resuming with approve ===")
+    print("\n=== STEP 2: Resuming with approve ===")
     final = agent.invoke(
         Command(resume={"decisions": [{"type": "approve"}]}),
         context=Context(customer_id=14),
@@ -155,8 +161,4 @@ if __name__ == "__main__":
         version="v2",
     )
     print("Final type:", type(final).__name__)
-    if isinstance(final, dict) and "messages" in final:
-        print("Agent response:", final["messages"][-1].content)
-    else:
-        print("Result", final)
-    print(result.value["messages"][-1].content)
+    print("Agent response:", final.value["messages"][-1].content)
