@@ -9,7 +9,9 @@ load_dotenv()
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from dataclasses import dataclass
-from langchain.agents.middleware import PIIMiddleware
+from langchain.agents.middleware import PIIMiddleware, HumanInTheLoopMiddleware
+from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.types import Command
 import sqlite3
 
 # Why a Context class: defines the SHAPE of trusted data the runtime will inject —
@@ -57,7 +59,7 @@ def get_my_recent_purchases(runtime: ToolRuntime[Context]) -> str:
     customer_id = runtime.context.customer_id
     conn = sqlite3.connect("Chinook.db")                                                   
     rows = conn.execute(
-        "SELECT t.Name, ar.Name, i.InvoiceDate "
+        "SELECT i.InvoiceId, t.Name, ar.Name, i.InvoiceDate "
         "FROM Invoice i "
         "JOIN InvoiceLine il ON i.InvoiceId = il.InvoiceId "
         "JOIN Track t ON il.TrackId = t.TrackId "
@@ -107,7 +109,15 @@ agent = create_agent(
         # still help while keeping the email out of the model's context and out of LangSmith
         # traces. Compliance baseline for any agent handling customer support.
         PIIMiddleware("email", strategy="redact", apply_to_input=True),
-        ],                                
+        HumanInTheLoopMiddleware(
+            interrupt_on={"request_refund": True},
+            description_prefix="Refund pending approval"
+            )
+        ],
+    # HITL requires checkpointing to handle interrupts.
+    # Use InMememorySaver in dev, AsyncPostgresSaver in prod
+    # Must configure a checkpointer to persist the graph state across interrupts.
+    checkpointer=InMemorySaver(),
     system_prompt=(
         "You are a music store assistant. "
         "Use the recommend_tracks tool when users ask for music recommendations. "
@@ -118,11 +128,35 @@ agent = create_agent(
     )
 
 if __name__ == "__main__":
-    result = agent.invoke({"messages": [{"role": "user", "content": "I want a refund on invoice 4"}]},
+    config = {"configurable": {"thread_id": "test-1"}}
+    # FIrst invoke - should pause at HITL gate
+    print("=== STEP 1: Invoking refund - expect pause ===")
+    result = agent.invoke({"messages": [{"role": "user", "content": "Please process a refund for invoice 156. I want this refunded now."}]},
                             # Why context here: in production, your auth layer would set customer_id
                             # from a logged-in session. For demo/smoke-test, I pass it manually as
                             # Customer 14 (Mark Philips in Chinook). When running via `langgraph dev`,
                             # the same value gets set in Studio's Context panel instead.
                             context=Context(customer_id=14),
+                            config=config,
+                            version="v2",
                             )
-    print(result["messages"][-1].content)
+    print("Result type:", type(result).__name__)
+    if hasattr(result, "interrupts") and result.interrupts:
+        print("PAUSED. Interrupts:", result.interrupts)
+    else:
+        print("Did NOT pause:", result)
+    
+    # Resume with approve
+    print("n=== STEP 2: Resuming with approve ===")
+    final = agent.invoke(
+        Command(resume={"decisions": [{"type": "approve"}]}),
+        context=Context(customer_id=14),
+        config=config,
+        version="v2",
+    )
+    print("Final type:", type(final).__name__)
+    if isinstance(final, dict) and "messages" in final:
+        print("Agent response:", final["messages"][-1].content)
+    else:
+        print("Result", final)
+    print(result.value["messages"][-1].content)
