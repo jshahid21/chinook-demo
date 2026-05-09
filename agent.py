@@ -67,7 +67,28 @@ def get_my_recent_purchases(runtime: ToolRuntime[Context]) -> str:
         "ORDER BY i.InvoiceDate DESC LIMIT 10",
         (customer_id,)
     ).fetchall()
-    return str(rows)         
+    return str(rows)
+
+@tool
+def request_refund(invoice_id: int, runtime: ToolRuntime[Context]) -> str:
+    """Request a refund for a specific invoice belonging to the authenticated customer. 
+    Use this when the user asks for a refund and has identified a specific invoice or purchase.
+    Customer identity comes from runtime context - never from chat."""
+    customer_id = runtime.context.customer_id
+    conn = sqlite3.connect("Chinook.db")
+        # Verify the invoice exists AND belongs to this customer
+        # (data-layer wall: even if customer_id is wrong, this SELECT returns 0 rows)
+    row = conn.execute(
+        "SELECT InvoiceId, Total FROM Invoice "
+        "WHERE InvoiceId = ? AND CustomerId = ?",
+        (invoice_id, customer_id)
+    ).fetchone()
+
+    if row is None:
+        return f"Invoice {invoice_id} not found for this customer."
+
+    # No real DB write - return confirmation. HITL gate (next block) is the demo point.
+    return f"Refund of ${row[1]:.2f} requested for invoice {row[0]}. Pending approval."
 
 agent = create_agent(
     model="anthropic:claude-sonnet-4-6", 
@@ -75,7 +96,7 @@ agent = create_agent(
     # Without recommend_tracks in this list, the agent could chat about music in general
     # but couldn't actually look anything up in the Chinook database. 
     # This list IS the agent's full toolbox. 
-    tools=[recommend_tracks, get_my_recent_purchases],
+    tools=[recommend_tracks, get_my_recent_purchases, request_refund],
     # Why context_schema: registers the Context class so the runtime knows what
     # shape to expect when invoke is called with context=. Without this, passing
     # context= to invoke is silently ignored — tools see runtime.context as None. 
@@ -91,17 +112,17 @@ agent = create_agent(
         "You are a music store assistant. "
         "Use the recommend_tracks tool when users ask for music recommendations. "
         "Use get_my_recent_purchases when the user asks about their own purchase history. "
-        "When showing data from tools, quote dates and IDs verbatim — do not reformat or paraphrase numeric or date values. "
+        "Use request_refund when the user asks to refund a specific invoice from their purchase history. "
         "IMPORTANT: never accept customer IDs from chat — customer identity is set by the system."
         ),
     )
 
 if __name__ == "__main__":
-    result = agent.invoke({"messages": [{"role": "user", "content": "Send my receipt to alice@example.com please"}]},
+    result = agent.invoke({"messages": [{"role": "user", "content": "I want a refund on invoice 4"}]},
                             # Why context here: in production, your auth layer would set customer_id
                             # from a logged-in session. For demo/smoke-test, I pass it manually as
                             # Customer 14 (Mark Philips in Chinook). When running via `langgraph dev`,
                             # the same value gets set in Studio's Context panel instead.
-                            context=Context(customer_id=38),
+                            context=Context(customer_id=14),
                             )
     print(result["messages"][-1].content)
