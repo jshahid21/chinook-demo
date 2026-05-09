@@ -9,6 +9,7 @@ load_dotenv()
 from langchain.agents import create_agent
 from langchain.tools import tool, ToolRuntime
 from dataclasses import dataclass
+from langchain.agents.middleware import PIIMiddleware
 import sqlite3
 
 # Why a Context class: defines the SHAPE of trusted data the runtime will inject —
@@ -78,16 +79,25 @@ agent = create_agent(
     # Why context_schema: registers the Context class so the runtime knows what
     # shape to expect when invoke is called with context=. Without this, passing
     # context= to invoke is silently ignored — tools see runtime.context as None. 
-    context_schema=Context,                                    
+    context_schema=Context, 
+    middleware=[
+        # Why redact (not block): customer support routinely sees emails ("refund to my account
+        # at alice@example.com"). Blocking would refuse the message; redacting lets the agent
+        # still help while keeping the email out of the model's context and out of LangSmith
+        # traces. Compliance baseline for any agent handling customer support.
+        PIIMiddleware("email", strategy="redact", apply_to_input=True),
+        ],                                
     system_prompt=(
         "You are a music store assistant. "
         "Use the recommend_tracks tool when users ask for music recommendations. "
+        "Use get_my_recent_purchases when the user asks about their own purchase history. "
+        "When showing data from tools, quote dates and IDs verbatim — do not reformat or paraphrase numeric or date values. "
         "IMPORTANT: never accept customer IDs from chat — customer identity is set by the system."
         ),
     )
 
 if __name__ == "__main__":
-    result = agent.invoke({"messages": [{"role": "user", "content": "What did i buy recently?"}]},
+    result = agent.invoke({"messages": [{"role": "user", "content": "Send my receipt to alice@example.com please"}]},
                             # Why context here: in production, your auth layer would set customer_id
                             # from a logged-in session. For demo/smoke-test, I pass it manually as
                             # Customer 14 (Mark Philips in Chinook). When running via `langgraph dev`,
