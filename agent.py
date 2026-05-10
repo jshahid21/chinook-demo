@@ -11,13 +11,18 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 import sqlite3
 import os
+import sys
 
 # Why a Context class: defines the SHAPE of trusted data the runtime will inject —
 # things the model is NOT allowed to control (like which customer is asking).
 # customer_id comes from authenticated session at the API boundary, NEVER from chat.
-# Per LangChain v1 docs, @dataclass is the canonical pattern (vs Pydantic).  
+# Per LangChain v1 docs, @dataclass is the canonical pattern (vs Pydantic).
 
-checkpointer = InMemorySaver() if __name__ == "__main__" else None
+# Use InMemorySaver everywhere EXCEPT under `langgraph dev` (which provides its own).
+# langgraph dev loads `langgraph_api` into sys.modules before importing this file;
+# we use that as the runner-detection signal. Keeps HITL working for: python agent.py,
+# python eval/evaluators.py, pytest, etc.
+checkpointer = None if "langgraph_api" in sys.modules else InMemorySaver()
 
 @dataclass 
 class Context:
