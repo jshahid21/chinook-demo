@@ -3,5 +3,6 @@ langchain-anthropic
 langgraph
 langgraph-cli[inmem]
 langsmith
+openevals
 pydantic
 python-dotenv

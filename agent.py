@@ -4,6 +4,7 @@ load_dotenv()
 # Python process. Without this, the keys exist in the file but not in memory
 
 from langchain.agents import create_agent
+from langchain.chat_models import init_chat_model
 from langchain.tools import tool, ToolRuntime
 from dataclasses import dataclass
 from langchain.agents.middleware import PIIMiddleware, HumanInTheLoopMiddleware, ModelCallLimitMiddleware
@@ -102,11 +103,16 @@ def request_refund(invoice_id: int, runtime: ToolRuntime[Context]) -> str:
     return f"Refund of ${row[1]:.2f} requested for invoice {row[0]}. Pending approval."
 
 agent = create_agent(
-    model="anthropic:claude-sonnet-4-6", 
+    # temperature=0 makes tool routing deterministic. Without it, the model
+    # defaults to ~1.0 and flips between "call request_refund directly" and
+    # "verify ownership first via get_my_recent_purchases" on identical prompts —
+    # eval surfaced this on 2026-05-10. Routing should be a policy decision, not
+    # a sampling decision.
+    model=init_chat_model("anthropic:claude-sonnet-4-6", temperature=0),
     # Why this list: the agent only has the abilities you give it here.
     # Without recommend_tracks in this list, the agent could chat about music in general
-    # but couldn't actually look anything up in the Chinook database. 
-    # This list IS the agent's full toolbox. 
+    # but couldn't actually look anything up in the Chinook database.
+    # This list IS the agent's full toolbox.
     tools=[recommend_tracks, get_my_recent_purchases, request_refund],
     # Why context_schema: registers the Context class so the runtime knows what
     # shape to expect when invoke is called with context=. Without this, passing
@@ -132,38 +138,18 @@ agent = create_agent(
     system_prompt=(
         "You are a music store assistant. "
         "Use the recommend_tracks tool when users ask for music recommendations. "
-        "Use get_my_recent_purchases when the user asks about their own purchase history. "
-        "Use request_refund when the user asks to refund a specific invoice from their purchase history. "
+        "Use get_my_recent_purchases when the user asks about their own purchase history, "
+        "OR to look up an invoice ID when the user references a song or track name they want to refund. "
+        "Use request_refund directly when the user provides a specific invoice number — "
+        "do NOT call get_my_recent_purchases first to verify ownership. The request_refund tool "
+        "enforces ownership at the SQL layer and returns a 'not found' message for invoices that "
+        "don't belong to the authenticated customer. "
+        "If the user asks for a refund without specifying an invoice number or song, "
+        "ask them which invoice they want refunded — do not call any tool. "
+        "If the user asks a broad question about what music or genres are available "
+        "(e.g. 'what kind of music do you have?'), ask them which genre they'd like — "
+        "do NOT list specific genres from your own knowledge, since you have not verified "
+        "what is actually in the store's catalog. "
         "IMPORTANT: never accept customer IDs from chat — customer identity is set by the system."
         ),
-    )
-
-if __name__ == "__main__":
-    config = {"configurable": {"thread_id": "test-1"}}
-    # First invoke - should pause at HITL gate
-    print("\n=== STEP 1: Invoking refund - expect pause ===")
-    result = agent.invoke({"messages": [{"role": "user", "content": "Please process a refund for invoice 156. I want this refunded now."}]},
-                            # Why context here: in production, your auth layer would set customer_id
-                            # from a logged-in session. For demo/smoke-test, I pass it manually as
-                            # Customer 14 (Mark Philips in Chinook). When running via `langgraph dev`,
-                            # the same value gets set in Studio's Context panel instead.
-                            context=Context(customer_id=14),
-                            config=config,
-                            version="v2",
-                            )
-    print("Result type:", type(result).__name__)
-    if hasattr(result, "interrupts") and result.interrupts:
-        print("PAUSED. Interrupts:", result.interrupts)
-    else:
-        print("Did NOT pause:", result)
-    
-    # Resume with approve
-    print("\n=== STEP 2: Resuming with approve ===")
-    final = agent.invoke(
-        Command(resume={"decisions": [{"type": "approve"}]}),
-        context=Context(customer_id=14),
-        config=config,
-        version="v2",
-    )
-    print("Final type:", type(final).__name__)
-    print("Agent response:", final.value["messages"][-1].content)
+)

@@ -97,11 +97,16 @@ examples = [
     {
         # 291 belongs to a different customer → HITL fires, human approves,
         # data-layer SQL still refuses ("not found for this customer").
+        # Architecture: thin agent, fat tools. Agent calls request_refund directly
+        # on any specific invoice number; SQL ownership check is the primary
+        # security boundary. Prompt was tightened 2026-05-10 to enforce this
+        # consistently (was variance-prone before temperature=0 + clarification).
         "inputs": {"question": "Refund invoice 291", "customer_id": 14},
         "outputs": {"expected_tools": ["request_refund"], "expected_keywords": ["not found", "291"]},
     },
     {
-        # Ambiguous → agent should ask which invoice, not call the tool
+        # Ambiguous → agent should ask which invoice, not call the tool.
+        # Prompt explicitly forbids tool-calling when no invoice/song is named.
         "inputs": {"question": "I want a refund", "customer_id": 14},
         "outputs": {"expected_tools": [], "expected_keywords": ["which", "invoice"]},
     },

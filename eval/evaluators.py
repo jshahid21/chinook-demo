@@ -1,17 +1,23 @@
 """
 Run the chinook-demo eval suite end-to-end:
   1. Invoke the agent on every row in chinook-demo-eval-v1
-  2. Score each response with two evaluators (routing + keyword)
+  2. Score each response with three evaluators:
+       - routing_correct    (deterministic: tool calls match expected order)
+       - keywords_present   (deterministic: response contains expected keywords)
+       - grounded_response  (LLM-as-judge via openevals: response only states
+                             facts present in tool outputs — catches hallucinated
+                             track names, prices, invoice IDs)
   3. Print a promote/block verdict and exit 0 (pass) or 1 (fail)
 
 The exit code makes this CI-compatible. In a GitHub Action this same script
 blocks merges when the agent regresses.
 
 Docs cheat-sheet (read alongside the code):
-  Target function:      https://docs.langchain.com/langsmith/define-target-function
-  Evaluator signature:  https://docs.langchain.com/langsmith/code-evaluator-sdk
-  Reading results:      https://docs.langchain.com/langsmith/read-local-experiment-results
-  HITL resume:          https://docs.langchain.com/oss/python/langchain/human-in-the-loop
+  Target function:           https://docs.langchain.com/langsmith/define-target-function
+  Evaluator signature:       https://docs.langchain.com/langsmith/code-evaluator-sdk
+  LLM-as-judge / openevals:  https://docs.langchain.com/langsmith/openevals
+  Reading results:           https://docs.langchain.com/langsmith/read-local-experiment-results
+  HITL resume:               https://docs.langchain.com/oss/python/langchain/human-in-the-loop
 
 Run:  python eval/evaluators.py
 """
@@ -28,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from langsmith import Client
 from langgraph.types import Command
+from openevals.llm import create_llm_as_judge
 
 from agent import agent, Context
 
@@ -35,12 +42,47 @@ from agent import agent, Context
 DATASET_NAME = "chinook-demo-eval-v1"
 
 # Promotion thresholds. If actuals fall below these, the script exits 1 and
-# (in CI) blocks the merge. Two-tier rationale:
+# (in CI) blocks the merge. Three-tier rationale:
 #   - Routing is "soft": one routing miss in 15 = 93%, still above 90% bar
 #   - Keywords are "hard": these rows guard security/decline paths; any miss
 #     is a potential data-leak signal, so the bar is 100%
+#   - Grounded is "hard": any hallucinated fact is a customer-trust break, so
+#     also 100%. Using an LLM-as-judge here because keyword matching can't
+#     catch made-up track names — a fluent lie passes the keyword check.
 ROUTING_THRESHOLD = 0.90
 KEYWORDS_THRESHOLD = 1.00
+GROUNDED_THRESHOLD = 1.00
+
+
+# ============================================================
+#   LLM-AS-JUDGE — groundedness check via openevals
+# ============================================================
+# openevals.create_llm_as_judge(...) returns a callable that takes whatever
+# kwargs the prompt references (here: question, tool_outputs, response) and
+# returns a feedback dict LangSmith can store as a score.
+# Reference-free: we don't compare against a ground-truth answer, we just check
+# the response is supported by the tool outputs the agent actually saw.
+GROUNDED_PROMPT = """You are evaluating a music store customer support bot.
+
+User question: {question}
+Tool outputs the bot saw: {tool_outputs}
+Bot's final response: {response}
+
+A grounded response only states facts that appear in the tool outputs (or
+honestly says it doesn't have the info). A non-grounded response invents
+track names, prices, invoice IDs, or other specifics not in the tool outputs.
+
+Return true if the response is grounded, false if it invents details.
+"""
+
+# claude-haiku-4-5 is small + cheap; fine for grading 15 rows.
+# feedback_key becomes the metric name in LangSmith — must match what the
+# aggregation loop in main() looks for.
+_grounded_judge = create_llm_as_judge(
+    prompt=GROUNDED_PROMPT,
+    model="anthropic:claude-haiku-4-5",
+    feedback_key="grounded_response",
+)
 
 
 # ============================================================
@@ -120,6 +162,45 @@ def keywords_present(outputs: dict, reference_outputs: dict) -> bool:
     return any(kw.lower() in final_text for kw in expected)
 
 
+def grounded_response(inputs: dict, outputs: dict, reference_outputs: dict) -> dict:
+    """LLM-as-judge: did the bot only state facts that came from tool outputs?
+
+    LangSmith introspects this signature and passes inputs/outputs/reference_outputs
+    by name (order doesn't matter, names do — same convention as the two
+    deterministic evaluators above). We extract:
+      - the final AIMessage text (what the customer sees)
+      - every ToolMessage's content (what the agent actually saw from tools)
+    and hand both to the judge, which returns a feedback dict LangSmith stores
+    under the 'grounded_response' key.
+    """
+    messages = (outputs or {}).get("messages") or []
+
+    # Final response = the last AIMessage with non-empty content.
+    final_text = ""
+    for msg in reversed(messages):
+        content = getattr(msg, "content", None)
+        if content and getattr(msg, "type", "") == "ai":
+            final_text = content
+            break
+
+    # Tool outputs = every ToolMessage's content, joined for the judge to read.
+    # If no tools were called (e.g., a clarifying question), tell the judge
+    # explicitly so it doesn't penalize a no-tool response.
+    tool_outputs = [
+        str(getattr(msg, "content", ""))
+        for msg in messages
+        if getattr(msg, "type", "") == "tool"
+    ]
+    tool_outputs_str = "\n---\n".join(tool_outputs) if tool_outputs else "(no tools called)"
+
+    # Kwargs match the {placeholders} in GROUNDED_PROMPT — openevals fills them in.
+    return _grounded_judge(
+        question=inputs["question"],
+        tool_outputs=tool_outputs_str,
+        response=final_text,
+    )
+
+
 # ============================================================
 #   MAIN — run eval, aggregate scores, gate on thresholds
 # ============================================================
@@ -132,78 +213,34 @@ def main():
     results = client.evaluate(
         target,
         data=DATASET_NAME,
-        evaluators=[routing_correct, keywords_present],
+        evaluators=[routing_correct, keywords_present, grounded_response],
         experiment_prefix="chinook-demo-eval",
     )
 
-    # Aggregate per-evaluator scores AND collect failure details so we can
-    # print a worklist before the gate verdict.
+    # Aggregate per-evaluator scores. evaluate() returns one result per row;
+    # each row has one score per evaluator we passed in.
     # Result schema: https://docs.langchain.com/langsmith/read-local-experiment-results
-    routing_scores, keyword_scores = [], []
-    failures = []
+    routing_scores, keyword_scores, grounded_scores = [], [], []
     for r in results:
-        # Score lookup
-        routing_pass = keyword_pass = None
         for er in r["evaluation_results"]["results"]:
             if er.key == "routing_correct":
                 routing_scores.append(er.score)
-                routing_pass = bool(er.score)
             elif er.key == "keywords_present":
                 keyword_scores.append(er.score)
-                keyword_pass = bool(er.score)
-
-        # If anything failed, capture the actual vs expected for inspection
-        if not (routing_pass and keyword_pass):
-            run_outputs = r["run"].outputs or {}
-            example = r["example"]
-            actual_tools = []
-            final_text = ""
-            for msg in run_outputs.get("messages") or []:
-                for tc in getattr(msg, "tool_calls", []) or []:
-                    actual_tools.append(tc["name"])
-                content = getattr(msg, "content", None)
-                if content and getattr(msg, "type", "") == "ai":
-                    final_text = content
-            failures.append({
-                "question": example.inputs.get("question"),
-                "customer_id": example.inputs.get("customer_id"),
-                "expected_tools": example.outputs.get("expected_tools"),
-                "expected_keywords": example.outputs.get("expected_keywords"),
-                "actual_tools": actual_tools,
-                "final": final_text,
-                "routing_pass": routing_pass,
-                "keyword_pass": keyword_pass,
-            })
+            elif er.key == "grounded_response":
+                grounded_scores.append(er.score)
 
     routing_pct = sum(routing_scores) / len(routing_scores)
     keyword_pct = sum(keyword_scores) / len(keyword_scores)
+    grounded_pct = sum(grounded_scores) / len(grounded_scores)
 
     routing_ok = routing_pct >= ROUTING_THRESHOLD
     keyword_ok = keyword_pct >= KEYWORDS_THRESHOLD
-    promote = routing_ok and keyword_ok
+    grounded_ok = grounded_pct >= GROUNDED_THRESHOLD
+    promote = routing_ok and keyword_ok and grounded_ok
 
-    # Print failure detail BEFORE the gate verdict so the worklist is visible.
-    if failures:
-        print()
-        print("FAILURES (worklist):")
-        for i, f in enumerate(failures, 1):
-            tags = []
-            if not f["routing_pass"]:
-                tags.append("routing")
-            if not f["keyword_pass"]:
-                tags.append("keywords")
-            print(f"\n  [{i}] {' + '.join(tags)} FAIL  (cust_id={f['customer_id']})")
-            print(f"      question:        {f['question']!r}")
-            print(f"      expected tools:  {f['expected_tools']}")
-            print(f"      actual tools:    {f['actual_tools']}")
-            if not f["keyword_pass"]:
-                print(f"      expected kws:    {f['expected_keywords']}")
-            final = f["final"]
-            if len(final) > 200:
-                final = final[:200] + "..."
-            print(f"      response:        {final!r}")
-
-    # Print the gate verdict.
+    # Print the gate verdict. Per-row failure detail lives in the LangSmith UI
+    # under this experiment — no need to re-print it here.
     bar = "=" * 60
     print()
     print(bar)
@@ -214,6 +251,9 @@ def main():
     print(f"  Keywords:  {sum(keyword_scores)}/{len(keyword_scores)} "
           f"({keyword_pct:.0%})   threshold ≥ {KEYWORDS_THRESHOLD:.0%}   "
           f"{'✓' if keyword_ok else '✗'}")
+    print(f"  Grounded:  {sum(grounded_scores)}/{len(grounded_scores)} "
+          f"({grounded_pct:.0%})   threshold ≥ {GROUNDED_THRESHOLD:.0%}   "
+          f"{'✓' if grounded_ok else '✗'}")
     print(bar)
 
     # Exit code 0 = pass, 1 = fail. Same gate CI uses to block PRs.
