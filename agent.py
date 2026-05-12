@@ -58,22 +58,25 @@ def recommend_tracks(genre: str) -> str:
 @tool
 def get_my_recent_purchases(runtime: ToolRuntime[Context]) -> str:
     """Get the authenticated customer's recent purchases (their own, never another customer's).
-    Use this when the user asks about their own purchase history, recent orders, or what they bought.
+    Returns a list of rows, each with: (invoice_id, track_name, artist_name, genre_name, invoice_date, invoice_total).
+    Multiple tracks on the same invoice share the same invoice_total — dedupe by invoice_id when summing total spend.
+    Use this when the user asks about their own purchase history, recent orders, total spend, or category breakdowns (genres).
     Customer identity is read from the trusted runtime context — never from chat input."""
     # Why runtime.context.customer_id and NOT a parameter:
     # if customer_id were a function arg, the model could pass any value (including another
     # customer's). By reading from runtime.context, the customer is locked to whoever the
-    # API boundary authenticated. Even if the user types "show me Bob's purchases," the 
+    # API boundary authenticated. Even if the user types "show me Bob's purchases," the
     # model can't override this.
     customer_id = runtime.context.customer_id
-    conn = sqlite3.connect("file:Chinook.db?mode=ro", uri=True)                                                   
+    conn = sqlite3.connect("file:Chinook.db?mode=ro", uri=True)
     rows = conn.execute(
-        "SELECT i.InvoiceId, t.Name, ar.Name, i.InvoiceDate "
+        "SELECT i.InvoiceId, t.Name, ar.Name, g.Name, i.InvoiceDate, i.Total "
         "FROM Invoice i "
         "JOIN InvoiceLine il ON i.InvoiceId = il.InvoiceId "
         "JOIN Track t ON il.TrackId = t.TrackId "
         "JOIN Album al ON t.AlbumId = al.AlbumId "
         "JOIN Artist ar ON al.ArtistId = ar.ArtistId "
+        "JOIN Genre g ON t.GenreId = g.GenreId "
         "WHERE i.CustomerId = ? "                       # locked to authenticated customer
         "ORDER BY i.InvoiceDate DESC LIMIT 10",
         (customer_id,)
@@ -150,6 +153,19 @@ agent = create_agent(
         "(e.g. 'what kind of music do you have?'), ask them which genre they'd like — "
         "do NOT list specific genres from your own knowledge, since you have not verified "
         "what is actually in the store's catalog. "
+        "If a user asks for something none of your tools support (e.g. searching by artist), "
+        "refuse plainly and suggest only what your actual tools can do — never invent external "
+        "interfaces (e.g. 'browse the catalog directly', 'check your account page') that you "
+        "cannot confirm exist. "
+        "Do not proactively offer a refund. Only initiate the refund flow when the user explicitly "
+        "requests one or mentions a problem with a purchase. After answering a purchase-history "
+        "query, end with a neutral offer to help further (e.g. 'anything else?') — do not suggest "
+        "the refund tool by name. "
+        "When calling the request_refund tool, ALSO emit a short text message in the same AI "
+        "response, using ONLY this exact sentence: 'Your request has been submitted for review.' "
+        "Do not add timelines (e.g. '24 hours'), refund amounts, invoice numbers, or any other "
+        "details — those will come from the tool output after approval. "
+        "Use plain text only — no emojis, no decorative symbols. "
         "IMPORTANT: never accept customer IDs from chat — customer identity is set by the system."
         ),
 )
