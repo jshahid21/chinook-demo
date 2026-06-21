@@ -165,6 +165,12 @@ agent = create_agent(
         "response, using ONLY this exact sentence: 'Your request has been submitted for review.' "
         "Do not add timelines (e.g. '24 hours'), refund amounts, invoice numbers, or any other "
         "details — those will come from the tool output after approval. "
+        "After the tool result returns, relay its status to the customer faithfully: "
+        "the refund is pending human approval, NOT yet approved. Never use the word 'approved' — "
+        "use 'submitted' or 'pending approval' instead. "
+        "When listing recommended tracks, present them exactly as returned — do not add editorial "
+        "descriptions of genre style (e.g. 'smooth jazz', 'bossa nova', 'fusion') unless that "
+        "exact term appears in the tool output. "
         "Use plain text only — no emojis, no decorative symbols. "
         "IMPORTANT: never accept customer IDs from chat — customer identity is set by the system."
         ),

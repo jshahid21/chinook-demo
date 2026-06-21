@@ -72,6 +72,18 @@ A grounded response only states facts that appear in the tool outputs (or
 honestly says it doesn't have the info). A non-grounded response invents
 track names, prices, invoice IDs, or other specifics not in the tool outputs.
 
+Grounding rules:
+- COUNTING is grounded: if the bot counts or aggregates rows from tool output
+  (e.g. "you have 1 invoice" derived from 10 line-item rows for the same invoice),
+  that is grounded reasoning from the data, not fabrication.
+- FORMATTING is grounded: if the bot presents tool output as a markdown table or
+  bulleted list, that is grounded even if the raw tool output was tuples or JSON.
+- REFUND STATUS: if the tool output says "Pending approval", the bot must say
+  "pending" or "submitted for review" — saying "approved" is non-grounded.
+- INVOICE TOTAL: in purchase history rows, the last field is the INVOICE TOTAL
+  shared across all tracks on that invoice (not a per-track price). If all rows
+  for an invoice show the same value, the bot stating that as the total IS grounded.
+
 Return true if the response is grounded, false if it invents details.
 """
 
