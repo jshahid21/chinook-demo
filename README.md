@@ -4,9 +4,11 @@ A production-patterned customer-support agent over the [Chinook](https://github.
 
 It's a **proof-of-concept built on production patterns**, not a deployed system — the patterns are the point.
 
-> **Full write-up:** the architecture decisions, the business framing, and the eval flywheel are walked through in the case study → **`<INSERT BLOG URL ON PUBLISH>`**. This README is the "how to run it"; the blog is the "why it's built this way."
+> **Full write-up:** the architecture decisions, the business framing, and the eval flywheel are walked through in the case study → **[Camille's Refund: A Case Study in Production-Grade Agent Engineering](https://medium.com/@jshahid812/camilles-refund-a-case-study-in-production-grade-agent-engineering-6ead23180bde)**. This README is the "how to run it"; the blog is the "why it's built this way."
 
 ## Architecture at a glance
+
+![The Chinook agent stack — model, middleware, tools, runtime, observability — with a greyed band of deliberately excluded options.](diagram-chinook-stack.png)
 
 - One `create_agent` loop — **3 tools** (2 reads, 1 write) and **3 middleware**.
 - **Tools:** `recommend_tracks`, `get_my_recent_purchases`, `request_refund`.
